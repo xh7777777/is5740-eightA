@@ -1,0 +1,12 @@
+# Core data stack
+pandas>=2.2.2
+numpy>=1.26
+matplotlib>=3.8
+seaborn>=0.13
+
+# Development and automation
+jupyterlab>=4.2
+nbconvert>=7.16
+pytest>=8.2
+black>=24.4
+isort>=5.13
