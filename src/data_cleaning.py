@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 
@@ -183,7 +183,203 @@ def convert_categoricals(df: pd.DataFrame) -> pd.DataFrame:
     return cleaned
 
 
-def clean_dataset(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+def standardize_units(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Ensure time-related columns are expressed in minutes and distances in kilometres."""
+    cleaned = df.copy()
+    adjustments: Dict[str, int] = {"time_unit_conversions": 0, "distance_standardised": 0}
+
+    # Time columns expected to be in minutes; detect second-based entries heuristically.
+    time_columns: List[str] = [
+        "Time_taken (min)",
+        "order_to_pick_minutes",
+        "pickup_to_delivery_minutes",
+        "Time_Orderd_minutes",
+        "Time_Order_picked_minutes",
+    ]
+    for col in time_columns:
+        if col not in cleaned.columns:
+            continue
+        series = pd.to_numeric(cleaned[col], errors="coerce")
+        if series.dropna().empty:
+            cleaned[col] = series
+            continue
+
+        # Treat values larger than 3 hours that are neatly divisible by 60 as seconds.
+        suspect_mask = (series > 180) & (series % 60 == 0)
+        if suspect_mask.any() and suspect_mask.mean() > 0.8:
+            series = series / 60
+            adjustments["time_unit_conversions"] += int(suspect_mask.sum())
+
+        # Cap extreme values at 24 hours to avoid downstream skew.
+        series = series.clip(upper=24 * 60)
+        cleaned[col] = series
+
+    distance_columns: List[str] = [
+        "haversine_km",
+        "Distance_km",
+        "Delivery_distance",
+    ]
+    for col in distance_columns:
+        if col not in cleaned.columns:
+            continue
+        series = pd.to_numeric(cleaned[col], errors="coerce")
+        if series.dropna().empty:
+            cleaned[col] = series
+            continue
+
+        # Detect metre-based measurements by looking for values > 1000.
+        if series.max() and series.max() > 1000:
+            series = series / 1000
+            adjustments["distance_standardised"] += int(series.notna().sum())
+        cleaned[col] = series
+
+    return cleaned, adjustments
+
+
+def detect_outliers(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Clip extreme values using the IQR rule for key numeric columns."""
+    cleaned = df.copy()
+    outlier_counts: Dict[str, int] = {"outliers_capped": 0}
+
+    columns_to_check = [
+        "Delivery_person_Age",
+        "Delivery_person_Ratings",
+        "Time_taken (min)",
+        "order_to_pick_minutes",
+        "pickup_to_delivery_minutes",
+    ]
+
+    for col in columns_to_check:
+        if col not in cleaned.columns:
+            continue
+        series = pd.to_numeric(cleaned[col], errors="coerce")
+        valid = series.dropna()
+        if valid.empty:
+            cleaned[col] = series
+            continue
+
+        q1, q3 = valid.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        if pd.isna(iqr) or iqr == 0:
+            cleaned[col] = series
+            continue
+
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        mask = (series < lower_bound) | (series > upper_bound)
+        outlier_counts["outliers_capped"] += int(mask.sum())
+        series = series.clip(lower=lower_bound, upper=upper_bound)
+        cleaned[col] = series
+
+    return cleaned, outlier_counts
+
+
+def fill_missing_values(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Impute missing values using data-type aware strategies."""
+    cleaned = df.copy()
+    fill_stats: Dict[str, int] = {
+        "numeric_missing_filled": 0,
+        "time_missing_filled": 0,
+        "categorical_missing_filled": 0,
+    }
+
+    time_columns = [col for col in cleaned.columns if col.endswith("_minutes")]
+    if "Time_taken (min)" in cleaned.columns:
+        time_columns.append("Time_taken (min)")
+    time_columns = list(dict.fromkeys(time_columns))
+
+    for col in time_columns:
+        if col not in cleaned.columns:
+            continue
+        series = pd.to_numeric(cleaned[col], errors="coerce")
+        if series.isna().any():
+            valid = series.dropna()
+            if not valid.empty:
+                median_value = valid.median()
+                missing_count = int(series.isna().sum())
+                cleaned[col] = series.fillna(median_value)
+                fill_stats["time_missing_filled"] += missing_count
+
+    numeric_cols = cleaned.select_dtypes(include=["number", "Float64", "Int64"]).columns.difference(time_columns)
+    for col in numeric_cols:
+        series = pd.to_numeric(cleaned[col], errors="coerce")
+        if series.isna().any():
+            valid = series.dropna()
+            if not valid.empty:
+                mean_value = valid.mean()
+                missing_count = int(series.isna().sum())
+                cleaned[col] = series.fillna(mean_value)
+                fill_stats["numeric_missing_filled"] += missing_count
+
+    categorical_cols = cleaned.select_dtypes(include=["object", "category"]).columns
+    for col in categorical_cols:
+        series = cleaned[col]
+        if series.isna().any():
+            mode_series = series.mode(dropna=True)
+            if not mode_series.empty:
+                mode_value = mode_series.iloc[0]
+                missing_count = int(series.isna().sum())
+                cleaned[col] = series.fillna(mode_value)
+                fill_stats["categorical_missing_filled"] += missing_count
+
+    return cleaned, fill_stats
+
+
+def remove_duplicates(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Drop exact duplicates and resolve clashes on critical identifier combinations."""
+    cleaned = df.copy()
+    duplicate_stats: Dict[str, int] = {
+        "duplicates_removed_exact": 0,
+        "duplicates_removed_key": 0,
+    }
+
+    before = len(cleaned)
+    cleaned = cleaned.drop_duplicates()
+    duplicate_stats["duplicates_removed_exact"] = before - len(cleaned)
+
+    key_candidates: List[str] = []
+    if "Order_ID" in cleaned.columns:
+        key_candidates.append("Order_ID")
+    elif "ID" in cleaned.columns:
+        key_candidates.append("ID")
+
+    for candidate in ["Delivery_person_ID", "Order_Date_clean"]:
+        if candidate in cleaned.columns:
+            key_candidates.append(candidate)
+
+    if len(key_candidates) >= 2:
+        sort_cols = [col for col in ["Order_Date_clean", "Time_Orderd_minutes", "Time_Order_picked_minutes"] if col in cleaned.columns]
+        if sort_cols:
+            cleaned = cleaned.sort_values(sort_cols)
+        before_key = len(cleaned)
+        cleaned = cleaned.drop_duplicates(subset=key_candidates, keep="first")
+        duplicate_stats["duplicates_removed_key"] = before_key - len(cleaned)
+
+    cleaned = cleaned.reset_index(drop=True)
+    return cleaned, duplicate_stats
+
+
+def normalize_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of df where numeric columns are min-max scaled."""
+    normalized = df.copy()
+    numeric_cols = normalized.select_dtypes(include=["number", "Float64", "Int64"]).columns
+    for col in numeric_cols:
+        series = pd.to_numeric(normalized[col], errors="coerce")
+        valid = series.dropna()
+        if valid.empty:
+            normalized[col] = series
+            continue
+        min_val = valid.min()
+        max_val = valid.max()
+        if max_val == min_val:
+            normalized[col] = series.where(series.isna(), 0.0)
+            continue
+        scaled = (series - min_val) / (max_val - min_val)
+        normalized[col] = scaled
+    return normalized
+
+
+def clean_dataset(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, int]]:
     """Run the full cleaning pipeline and collect simple issue counters."""
     issues: Dict[str, int] = {}
 
@@ -204,9 +400,23 @@ def clean_dataset(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, int]]:
 
     cleaned = compute_time_intervals(cleaned)
 
+    cleaned, unit_stats = standardize_units(cleaned)
+    issues.update({k: v for k, v in unit_stats.items() if v})
+
+    cleaned, outlier_stats = detect_outliers(cleaned)
+    issues.update({k: v for k, v in outlier_stats.items() if v})
+
+    cleaned, fill_stats = fill_missing_values(cleaned)
+    issues.update({k: v for k, v in fill_stats.items() if v})
+
     cleaned = convert_categoricals(cleaned)
 
-    return cleaned, issues
+    cleaned, duplicate_stats = remove_duplicates(cleaned)
+    issues.update({k: v for k, v in duplicate_stats.items() if v})
+
+    normalized = normalize_numeric_columns(cleaned)
+
+    return cleaned, normalized, issues
 
 
 def save_processed_dataset(df: pd.DataFrame, path: Path = PROCESSED_DATA_PATH) -> None:
@@ -221,10 +431,14 @@ def main() -> None:
     raw_df = load_raw_dataset()
 
     # Step 2: Apply the cleaning pipeline to standardise fields and engineer features.
-    cleaned_df, issues = clean_dataset(raw_df)
+    cleaned_df, normalized_df, issues = clean_dataset(raw_df)
 
     # Step 3: Write the processed output for downstream analysis bundles.
     save_processed_dataset(cleaned_df)
+
+    # Optionally persist the normalised view alongside the primary dataset for modelling experiments.
+    normalized_path = PROCESSED_DATA_PATH.with_name("zomato_deliveries_normalized.csv")
+    save_processed_dataset(normalized_df, normalized_path)
 
     # Step 4: Emit a concise diagnostic summary to assist manual review.
     summary_lines = ["Cleaning summary:"]
@@ -232,6 +446,7 @@ def main() -> None:
         summary_lines.append(f"  - {key}: {count}")
     print("\n".join(summary_lines))
     print(f"Processed dataset saved to {PROCESSED_DATA_PATH}")
+    print(f"Normalized dataset saved to {normalized_path}")
 
 
 if __name__ == "__main__":

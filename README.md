@@ -1,22 +1,3 @@
-#### 数据清洗
-City：拼写纠正；转 category。
-
-所有字符串列：去空格、标准缺失值处理。
-
-Time_Orderd, Time_Order_picked：小数→HH:MM、HH:MM:SS截短、24:xx截断、失败置 NA；派生 _clean 与 _minutes。
-
-Order_Date：按 DD-MM-YYYY 解析 → Order_Date_clean。
-
-Delivery_person_Age：不在 18–60 置 NA。
-
-Delivery_person_Ratings：不在 1–5 置 NA。
-
-multiple_deliveries：非 {0,1,2,3} 置 NA。
-
-四个经纬度列：0 → NA。
-
-依赖上述字段派生：order_to_pick_minutes、pickup_to_delivery_minutes（含跨日与负值处理）。
-
 #### 字段说明（data/processed）
 | 字段 | 含义 | 备注 |
 | --- | --- | --- |
@@ -60,3 +41,33 @@ multiple_deliveries：非 {0,1,2,3} 置 NA。
 - `Delivery_person_Ratings` 与 `Vehicle_condition`：分别与耗时呈 -0.34 与 -0.23 的相关性，较高评分和更佳车辆状况有助于缩短配送时间，可作为人员与车辆管理指标。
 - `pickup_to_delivery_minutes`：与总耗时高度相关（0.91），可拆分为可优化的末端配送阶段指标；相反，`haversine_km` 与总耗时几乎无线性关系，暗示距离不是当前瓶颈。
 - 数据总量 45,584 单，整体平均耗时 26.3 分钟，90 分位为 40 分钟，可作为评估服务水平的基准线。
+
+#### 数据清洗
+  - data/raw/zomato_dataset.csv：20 列，未清洗的原始数据；包含异常时间（小数、24:xx、空值）、拼写
+  错误的城市名称、评分/年龄越界值，缺失值未处理。
+  - data/processed/zomato_deliveries_clean.csv：27 列，与原始行数相同；在原始字段基础上补
+  齐清洗与派生列（Time_Orderd_clean, *_minutes, Order_Date_clean, order_to_pick_minutes,
+  pickup_to_delivery_minutes 等），并完成城市纠正、缺失值/异常值处理及类型标准化。
+  - data/processed/zomato_deliveries_featured.csv：30 列；全部保留 clean 数据，再新增建模特征如
+  haversine_km（直线距离）、Order_dow（星期）、Order_hour（小时），方便做距离/时间维度的分析。
+  - data/processed/zomato_deliveries_normalized.csv：27 列；字段与 clean 相同，但所有数值列经过
+  MinMaxScaler 映射到 0–1 区间，用于需要无量纲输入的算法。
+
+#### 与原始数据的主要差异
+
+  - 缺失值：raw 中 Time_Orderd 各城市缺失率约 3–5%，clean 版已清洗/补齐并额外留存 _clean 列；
+  normalized 同步使用补齐后的数据。
+  - 异常值：clean/featured/normalized 统一剪裁年龄、评分与耗时的异常值，原始表中仍保留。
+  - 派生特征：raw 缺少分钟数、跨日间隔、距离等工程化字段，clean 起开始提供时间差；featured 再增加
+  距离与日期衍生维度；normalized 仅对 clean 的数值列做规模化。
+  - 数据一致性：clean 及之后版本修正 Metropolitian 等拼写、去除重复行并保证时间单位统一；raw 保留
+  原始状态。
+
+#### 新增清洗逻辑
+- 缺失值填充：`*_minutes` 与 `Time_taken (min)` 使用中位数，其他数值列按均值，分类列按众数补齐；计入 `issues` 统计。
+- 异常值处理：对年龄、评分、时间耗时列应用 IQR 限幅，将极端值裁剪到四分位区间边界。
+- 单位标准化：检测时间列是否混用秒，统一为分钟并上限 24 小时；距离列（含 `haversine_km`/`Delivery_distance` 等）统一转换为公里。
+- 重复数据：先移除完全重复行，再按 `ID`/`Delivery_person_ID`/`Order_Date_clean` 组合保留最早记录。
+- 归一化导出：清洗后的数据再生成一份 MinMax 归一化副本 `data/processed/zomato_deliveries_normalized.csv` ，供建模使用。
+
+
